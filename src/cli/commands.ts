@@ -1,5 +1,7 @@
 import chalk from "chalk";
+import ora from "ora";
 import { createInterface } from "readline";
+import { readFileSync, existsSync } from "fs";
 import {
   loadAddresses,
   saveAddresses,
@@ -8,6 +10,8 @@ import {
   findAddress,
   loadHistory,
 } from "../lib/store.js";
+import { verifyAddress, resolveInput, searchProfiles } from "../lib/polymarket-api.js";
+import { logCommand, getLogPath } from "../lib/logger.js";
 import type { FollowedAddress, CopyMode, Priority, SellMode } from "../types/index.js";
 import { DEFAULT_FILTERS } from "../types/index.js";
 
@@ -25,16 +29,144 @@ function isValidAddress(addr: string): boolean {
   return /^0x[a-fA-F0-9]{40}$/.test(addr);
 }
 
-export async function addCommand(address: string) {
-  if (!isValidAddress(address)) {
-    console.log(chalk.red("Invalid Ethereum address format"));
+async function resolveToAddress(input: string): Promise<{ address: string; username?: string } | null> {
+  if (isValidAddress(input)) {
+    return { address: input };
+  }
+
+  const spinner = ora(`Searching for username "${input}"...`).start();
+  const results = await searchProfiles(input);
+  spinner.stop();
+
+  if (results.length === 0) {
+    console.log(chalk.red(`No Polymarket user found for "${input}"`));
+    return null;
+  }
+
+  const exact = results.find((r) => r.username.toLowerCase() === input.toLowerCase());
+  if (exact) {
+    console.log(chalk.green(`Resolved "${input}" → ${exact.address.slice(0, 10)}...`));
+    return { address: exact.address, username: exact.username };
+  }
+
+  if (results.length === 1) {
+    const r = results[0];
+    console.log(chalk.green(`Resolved "${input}" → ${r.username} (${r.address.slice(0, 10)}...)`));
+    return { address: r.address, username: r.username };
+  }
+
+  console.log(chalk.bold(`\nMultiple profiles found for "${input}":\n`));
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    console.log(`  ${i + 1}) ${r.username} ${chalk.dim(`(${r.address.slice(0, 10)}...)`)}`);
+  }
+  const choice = await prompt(chalk.cyan(`Select [1-${results.length}]: `));
+  const idx = parseInt(choice) - 1;
+  if (idx < 0 || idx >= results.length) {
+    console.log(chalk.red("Invalid selection."));
+    return null;
+  }
+  const selected = results[idx];
+  return { address: selected.address, username: selected.username };
+}
+
+export async function verifyCommand(input: string) {
+  const resolved = await resolveToAddress(input);
+  if (!resolved) {
+    logCommand("verify", [input], "error", undefined, "address not resolved");
     return;
   }
 
+  const spinner = ora(`Verifying ${resolved.address.slice(0, 10)}...`).start();
+  const profile = await verifyAddress(resolved.address);
+  spinner.stop();
+
+  printProfile(resolved.address, profile, resolved.username);
+  logCommand("verify", [input], "ok", {
+    address: resolved.address,
+    username: resolved.username,
+    valid: profile.valid,
+    trades: profile.tradeCount,
+  });
+}
+
+function printProfile(address: string, profile: Awaited<ReturnType<typeof verifyAddress>>, username?: string) {
+  const label = username ? `${username} (${address})` : address;
+  console.log(chalk.bold(`\n  Address Verification: ${label}\n`));
+
+  if (!profile.valid) {
+    console.log(chalk.red("  ✗ Invalid address format\n"));
+    return;
+  }
+
+  if (!profile.hasActivity) {
+    console.log(chalk.yellow("  ⚠ No trade activity found on Polymarket"));
+    console.log(chalk.dim("    This address has never traded, or uses a different proxy wallet.\n"));
+    return;
+  }
+
+  console.log(chalk.green("  ✓ Valid Polymarket trader\n"));
+  console.log(`  Trades found:    ${chalk.white(String(profile.tradeCount))} (last 100)`);
+  console.log(`  First trade:     ${chalk.dim(profile.firstTradeAt ?? "—")}`);
+  console.log(`  Last trade:      ${chalk.dim(profile.lastTradeAt ?? "—")}`);
+  console.log(`  Open positions:  ${chalk.white(String(profile.positionCount))}`);
+
+  if (profile.positions.length > 0) {
+    console.log(chalk.bold("\n  Current Positions:"));
+    for (const p of profile.positions.slice(0, 8)) {
+      const size = `$${p.size.toFixed(2)}`.padEnd(10);
+      const title = p.title.slice(0, 45);
+      console.log(`    ${size} ${chalk.dim(p.outcome.padEnd(5))} ${title}`);
+    }
+    if (profile.positionCount > 8) {
+      console.log(chalk.dim(`    ... and ${profile.positionCount - 8} more`));
+    }
+  }
+
+  if (profile.recentTrades.length > 0) {
+    console.log(chalk.bold("\n  Recent Trades:"));
+    for (const t of profile.recentTrades.slice(0, 8)) {
+      const side = t.side === "BUY" ? chalk.green("BUY ") : chalk.red("SELL");
+      const amt = `$${parseFloat(t.amount || "0").toFixed(2)}`.padEnd(10);
+      const q = t.question.slice(0, 38);
+      console.log(`    ${chalk.dim(t.time)} ${side} ${amt} ${q}`);
+    }
+    if (profile.recentTrades.length > 8) {
+      console.log(chalk.dim(`    ... and ${profile.recentTrades.length - 8} more`));
+    }
+  }
+
+  console.log();
+}
+
+export async function addCommand(input: string) {
+  const resolved = await resolveToAddress(input);
+  if (!resolved) {
+    logCommand("add", [input], "error", undefined, "address not resolved");
+    return;
+  }
+  const { address, username } = resolved;
+
   const existing = findAddress(address);
   if (existing) {
-    console.log(chalk.yellow(`Address already exists as "${existing.nickname ?? address.slice(0, 8)}". Use 'edit' to modify.`));
+    console.log(chalk.yellow(`Address already exists as "${existing.nickname ?? existing.username ?? address.slice(0, 8)}". Use 'edit' to modify.`));
+    logCommand("add", [input], "error", { address }, "already exists");
     return;
+  }
+
+  const spinner = ora("Checking address on Polymarket...").start();
+  const profile = await verifyAddress(address);
+  spinner.stop();
+
+  printProfile(address, profile, username);
+
+  if (!profile.hasActivity) {
+    const proceed = await prompt(chalk.yellow("No trade history found. Add anyway? [y/N]: "));
+    if (proceed.toLowerCase() !== "y") {
+      console.log(chalk.dim("Cancelled."));
+      logCommand("add", [input], "error", { address }, "cancelled by user");
+      return;
+    }
   }
 
   const nickname = await prompt(chalk.cyan("Nickname (optional): "));
@@ -110,6 +242,7 @@ export async function addCommand(address: string) {
 
   const entry: FollowedAddress = {
     address,
+    username: username || undefined,
     nickname: nickname || undefined,
     enabled: true,
     copyMode,
@@ -132,13 +265,16 @@ export async function addCommand(address: string) {
   };
 
   upsertAddress(entry);
-  console.log(chalk.green(`\n✓ Added ${nickname || address.slice(0, 10)} (${copyMode}, ${priority} priority)`));
+  const displayName = nickname || username || address.slice(0, 10);
+  console.log(chalk.green(`\n✓ Added ${displayName} (${copyMode}, ${priority} priority)`));
+  logCommand("add", [input], "ok", { address, username, nickname: nickname || undefined, mode: copyMode, priority });
 }
 
 export function listCommand() {
   const addresses = loadAddresses();
   if (addresses.length === 0) {
     console.log(chalk.yellow("No addresses configured. Use 'add <address>' to get started."));
+    logCommand("list", [], "ok", { count: 0 });
     return;
   }
 
@@ -146,7 +282,7 @@ export function listCommand() {
 
   const header = [
     "Status".padEnd(8),
-    "Nickname".padEnd(14),
+    "Name".padEnd(18),
     "Address".padEnd(14),
     "Mode".padEnd(12),
     "Amount".padEnd(10),
@@ -155,11 +291,11 @@ export function listCommand() {
   ].join(" ");
 
   console.log(chalk.dim(header));
-  console.log(chalk.dim("─".repeat(80)));
+  console.log(chalk.dim("─".repeat(90)));
 
   for (const a of addresses) {
     const status = a.enabled ? chalk.green("● ON ") : chalk.red("● OFF");
-    const nick = (a.nickname ?? "—").padEnd(14).slice(0, 14);
+    const name = (a.username ?? a.nickname ?? "—").slice(0, 18).padEnd(18);
     const addr = (a.address.slice(0, 6) + ".." + a.address.slice(-4)).padEnd(14);
     const mode = a.copyMode.padEnd(12);
 
@@ -172,20 +308,26 @@ export function listCommand() {
     const prio = a.priority.padEnd(8);
     const counter = a.counterMode ? chalk.yellow("YES") : chalk.dim("no");
 
-    console.log(`  ${status}  ${nick} ${addr} ${mode} ${amount} ${prio} ${counter}`);
+    console.log(`  ${status}  ${name} ${addr} ${mode} ${amount} ${prio} ${counter}`);
   }
 
   console.log();
+  logCommand("list", [], "ok", { count: addresses.length });
 }
 
-export async function editCommand(address: string) {
-  const entry = findAddress(address);
+export async function editCommand(input: string) {
+  let entry = findAddress(input);
+  if (!entry && !isValidAddress(input)) {
+    const resolved = await resolveToAddress(input);
+    if (resolved) entry = findAddress(resolved.address);
+  }
   if (!entry) {
-    console.log(chalk.red(`Address not found: ${address}`));
+    console.log(chalk.red(`Address not found: ${input}`));
+    logCommand("edit", [input], "error", undefined, "not found");
     return;
   }
 
-  console.log(chalk.bold(`\nEditing: ${entry.nickname ?? entry.address}`));
+  console.log(chalk.bold(`\nEditing: ${entry.username ?? entry.nickname ?? entry.address}`));
   console.log(chalk.dim("Press Enter to keep current value\n"));
 
   const nick = await prompt(`Nickname [${entry.nickname ?? "—"}]: `);
@@ -218,7 +360,8 @@ export async function editCommand(address: string) {
   else if (prioChoice === "3") entry.priority = "slow";
 
   upsertAddress(entry);
-  console.log(chalk.green(`\n✓ Updated ${entry.nickname ?? entry.address.slice(0, 10)}`));
+  console.log(chalk.green(`\n✓ Updated ${entry.nickname ?? entry.username ?? entry.address.slice(0, 10)}`));
+  logCommand("edit", [input], "ok", { address: entry.address, mode: entry.copyMode, priority: entry.priority });
 }
 
 export function pauseCommand(target: string) {
@@ -230,17 +373,20 @@ export function pauseCommand(target: string) {
     }
     saveAddresses(all);
     console.log(chalk.yellow(`Paused ${count} address(es)`));
+    logCommand("pause", [target], "ok", { count });
     return;
   }
 
   const entry = findAddress(target);
   if (!entry) {
     console.log(chalk.red(`Address not found: ${target}`));
+    logCommand("pause", [target], "error", undefined, "not found");
     return;
   }
   entry.enabled = false;
   upsertAddress(entry);
-  console.log(chalk.yellow(`Paused ${entry.nickname ?? entry.address.slice(0, 10)}`));
+  console.log(chalk.yellow(`Paused ${entry.nickname ?? entry.username ?? entry.address.slice(0, 10)}`));
+  logCommand("pause", [target], "ok", { address: entry.address });
 }
 
 export function resumeCommand(target: string) {
@@ -252,24 +398,29 @@ export function resumeCommand(target: string) {
     }
     saveAddresses(all);
     console.log(chalk.green(`Resumed ${count} address(es)`));
+    logCommand("resume", [target], "ok", { count });
     return;
   }
 
   const entry = findAddress(target);
   if (!entry) {
     console.log(chalk.red(`Address not found: ${target}`));
+    logCommand("resume", [target], "error", undefined, "not found");
     return;
   }
   entry.enabled = true;
   upsertAddress(entry);
-  console.log(chalk.green(`Resumed ${entry.nickname ?? entry.address.slice(0, 10)}`));
+  console.log(chalk.green(`Resumed ${entry.nickname ?? entry.username ?? entry.address.slice(0, 10)}`));
+  logCommand("resume", [target], "ok", { address: entry.address });
 }
 
 export function removeCommand(target: string) {
   if (removeAddress(target)) {
     console.log(chalk.green(`Removed ${target.slice(0, 10)}...`));
+    logCommand("remove", [target], "ok");
   } else {
     console.log(chalk.red(`Address not found: ${target}`));
+    logCommand("remove", [target], "error", undefined, "not found");
   }
 }
 
@@ -279,6 +430,7 @@ export function historyCommand(options: { limit?: string }) {
 
   if (history.length === 0) {
     console.log(chalk.yellow("No trade history yet."));
+    logCommand("history", [], "ok", { count: 0 });
     return;
   }
 
@@ -298,11 +450,18 @@ export function historyCommand(options: { limit?: string }) {
     const sideCol = side === "BUY" ? chalk.green(side) : chalk.red(side);
     const amount = (exec.executedTrade?.amount ?? exec.sourceTrade.amount).toFixed(2);
     const market = (exec.market?.question ?? exec.sourceTrade.tokenId).slice(0, 35);
-    const reason = exec.reason ? chalk.dim(` (${exec.reason})`) : "";
 
-    console.log(`  ${statusIcon} ${chalk.dim(time)} ${sideCol} $${amount.padEnd(8)} ${chalk.dim(addr)} ${market}${reason}`);
+    let detail = "";
+    if (exec.failureCode) {
+      detail = chalk.dim(` [${exec.failureCode}]`);
+    } else if (exec.reason) {
+      detail = chalk.dim(` (${exec.reason})`);
+    }
+
+    console.log(`  ${statusIcon} ${chalk.dim(time)} ${sideCol} $${amount.padEnd(8)} ${chalk.dim(addr)} ${market}${detail}`);
   }
   console.log();
+  logCommand("history", [`--limit=${limit}`], "ok", { shown: history.length });
 }
 
 export function statusCommand() {
@@ -326,13 +485,13 @@ export function statusCommand() {
     console.log(`  Last execution:    ${chalk.dim(last.timestamp)}`);
   }
   console.log();
+  logCommand("status", [], "ok", { total: addresses.length, executions: history.length });
 }
 
 export async function importCommand(file: string) {
-  const { readFileSync, existsSync } = await import("fs");
-
   if (!existsSync(file)) {
     console.log(chalk.red(`File not found: ${file}`));
+    logCommand("import", [file], "error", undefined, "file not found");
     return;
   }
 
@@ -355,6 +514,7 @@ export async function importCommand(file: string) {
 
   if (entries.length === 0) {
     console.log(chalk.yellow("No valid addresses found in file."));
+    logCommand("import", [file], "error", undefined, "no valid addresses");
     return;
   }
 
@@ -385,4 +545,59 @@ export async function importCommand(file: string) {
   }
 
   console.log(chalk.green(`✓ Imported ${added} addresses (${skipped} skipped/duplicates)`));
+  logCommand("import", [file], "ok", { added, skipped });
+}
+
+export function logsCommand(options: { errors?: boolean; commands?: boolean; date?: string }) {
+  let logPath: string;
+  let label: string;
+
+  if (options.commands) {
+    logPath = getLogPath("commands");
+    label = "Command Logs";
+  } else if (options.errors) {
+    logPath = getLogPath("errors");
+    label = "Error Logs";
+  } else {
+    logPath = getLogPath("engine", options.date);
+    label = `Engine Logs (${options.date ?? new Date().toISOString().slice(0, 10)})`;
+  }
+
+  if (!existsSync(logPath)) {
+    console.log(chalk.yellow(`No log file found: ${logPath}`));
+    return;
+  }
+
+  const content = readFileSync(logPath, "utf-8").trim();
+  if (!content) {
+    console.log(chalk.yellow("Log file is empty."));
+    return;
+  }
+
+  console.log(chalk.bold(`\n  ${label}\n`));
+
+  const lines = content.split("\n").slice(-50);
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      const ts = chalk.dim((entry.ts ?? "").slice(11, 23));
+      const level = entry.level ?? entry.cmd ?? "?";
+
+      const levelStyle: Record<string, (s: string) => string> = {
+        trade: chalk.green,
+        error: chalk.red,
+        warn: chalk.yellow,
+        skip: chalk.gray,
+        info: chalk.blue,
+      };
+      const style = levelStyle[level] ?? chalk.white;
+      const levelStr = style(`[${(level as string).toUpperCase().padEnd(5)}]`);
+
+      const msg = entry.msg ?? `${entry.cmd} ${(entry.args ?? []).join(" ")}`;
+      console.log(`  ${ts} ${levelStr} ${msg}`);
+    } catch {
+      console.log(chalk.dim(`  ${line}`));
+    }
+  }
+  console.log();
 }

@@ -1,9 +1,10 @@
-import type { FollowedAddress, ActivityItem, MarketInfo } from "../types/index.js";
+import type { FollowedAddress, ActivityItem, MarketInfo, FailureCode } from "../types/index.js";
 import { loadHistory } from "../lib/store.js";
 
 export interface FilterResult {
   pass: boolean;
   reason?: string;
+  code?: FailureCode;
 }
 
 export function applyFilters(
@@ -14,14 +15,27 @@ export function applyFilters(
   const { filters } = config;
   const usdcAmount = parseFloat(activity.usdcSize ?? activity.size ?? "0");
 
+  const isSell = (activity.side ?? "").toUpperCase() === "SELL";
+  if (isSell && filters.sellMode === "ignore") {
+    return { pass: false, reason: "sell mode set to ignore", code: "FILTER_SELL_IGNORED" };
+  }
+
   if (filters.minTrigger && usdcAmount < filters.minTrigger) {
-    return { pass: false, reason: `amount $${usdcAmount} < minTrigger $${filters.minTrigger}` };
+    return {
+      pass: false,
+      reason: `amount $${usdcAmount} < minTrigger $${filters.minTrigger}`,
+      code: "FILTER_MIN_TRIGGER",
+    };
   }
 
   if (filters.maxOdds) {
     const price = parseFloat(activity.price ?? "0");
     if (price > 0 && price > filters.maxOdds) {
-      return { pass: false, reason: `odds ${price} > maxOdds ${filters.maxOdds}` };
+      return {
+        pass: false,
+        reason: `odds ${price} > maxOdds ${filters.maxOdds}`,
+        code: "FILTER_MAX_ODDS",
+      };
     }
   }
 
@@ -37,7 +51,11 @@ export function applyFilters(
       .reduce((sum, e) => sum + (e.executedTrade?.amount ?? 0), 0);
 
     if (spent >= filters.maxPerMarket) {
-      return { pass: false, reason: `market cap reached: $${spent} >= $${filters.maxPerMarket}` };
+      return {
+        pass: false,
+        reason: `market cap reached: $${spent} >= $${filters.maxPerMarket}`,
+        code: "FILTER_MAX_PER_MARKET",
+      };
     }
   }
 
@@ -45,7 +63,11 @@ export function applyFilters(
     const endMs = new Date(market.endDate).getTime();
     const daysOut = (endMs - Date.now()) / (1000 * 60 * 60 * 24);
     if (daysOut > filters.maxDaysOut) {
-      return { pass: false, reason: `market ends in ${Math.round(daysOut)}d > ${filters.maxDaysOut}d` };
+      return {
+        pass: false,
+        reason: `market ends in ${Math.round(daysOut)}d > ${filters.maxDaysOut}d`,
+        code: "FILTER_MAX_DAYS_OUT",
+      };
     }
   }
 

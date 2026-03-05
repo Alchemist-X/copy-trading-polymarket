@@ -39,10 +39,15 @@ export function saveAddresses(addresses: FollowedAddress[]) {
   writeJSON<AddressesStore>("addresses.json", { addresses });
 }
 
-export function findAddress(addr: string): FollowedAddress | undefined {
+export function findAddress(query: string): FollowedAddress | undefined {
   const all = loadAddresses();
-  const lower = addr.toLowerCase();
-  return all.find((a) => a.address.toLowerCase() === lower);
+  const lower = query.toLowerCase();
+  return all.find(
+    (a) =>
+      a.address.toLowerCase() === lower ||
+      a.nickname?.toLowerCase() === lower ||
+      a.username?.toLowerCase() === lower,
+  );
 }
 
 export function upsertAddress(entry: FollowedAddress) {

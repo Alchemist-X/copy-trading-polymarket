@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { loadEnv, initClient } from "./lib/client.js";
-import { setVerbose, log } from "./lib/logger.js";
+import { setVerbose, setDashboardMode, log } from "./lib/logger.js";
 import { TradeMonitor } from "./core/monitor.js";
 import { Dashboard } from "./cli/dashboard.js";
 import {
@@ -14,6 +14,8 @@ import {
   historyCommand,
   statusCommand,
   importCommand,
+  verifyCommand,
+  logsCommand,
 } from "./cli/commands.js";
 
 const program = new Command();
@@ -32,6 +34,7 @@ program
   .option("--no-dashboard", "Disable live dashboard")
   .action(async (opts) => {
     setVerbose(opts.verbose);
+    if (opts.dashboard !== false) setDashboardMode(true);
 
     console.log(chalk.bold.cyan("\n  Polymarket Copy Trading Engine\n"));
     log("info", "Initializing CLOB client...");
@@ -60,13 +63,7 @@ program
     });
 
     if (opts.dashboard !== false) {
-      const dashboard = new Dashboard(monitor);
-
-      try {
-        const bal = await (client as any).getBalanceAllowance?.({ asset_type: "USDC" });
-        if (bal?.balance) dashboard.setBalance(`$${parseFloat(bal.balance).toFixed(2)}`);
-      } catch { /* ignore */ }
-
+      const dashboard = new Dashboard(monitor, env.funderAddress);
       dashboard.start();
     }
 
@@ -75,7 +72,7 @@ program
 
 program
   .command("add <address>")
-  .description("Add an address to follow")
+  .description("Add an address or username to follow")
   .action(addCommand);
 
 program
@@ -118,5 +115,18 @@ program
   .command("import <file>")
   .description("Import addresses from CSV or JSON file")
   .action(importCommand);
+
+program
+  .command("verify <address>")
+  .description("Check if an address/username is a valid Polymarket trader with trade history")
+  .action(verifyCommand);
+
+program
+  .command("logs")
+  .description("View log files")
+  .option("--errors", "Show only error logs")
+  .option("--commands", "Show only command logs")
+  .option("--date <date>", "Show engine logs for a specific date (YYYY-MM-DD)")
+  .action(logsCommand);
 
 program.parse();

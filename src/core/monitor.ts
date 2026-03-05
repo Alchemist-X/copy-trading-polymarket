@@ -1,7 +1,7 @@
 import type { ClobClient } from "@polymarket/clob-client";
-import type { FollowedAddress, MonitorConfig, ActivityItem } from "../types/index.js";
+import type { FollowedAddress, MonitorConfig, ActivityItem, TradeExecution, FailureCode } from "../types/index.js";
 import { DEFAULT_MONITOR_CONFIG } from "../types/index.js";
-import { loadAddresses, isSeen, markSeen, updateCursor, getCursor } from "../lib/store.js";
+import { loadAddresses, saveAddresses, isSeen, markSeen, updateCursor, getCursor, appendExecution, loadState } from "../lib/store.js";
 import { fetchActivity, fetchMarketByCondition } from "../lib/polymarket-api.js";
 import { log } from "../lib/logger.js";
 import { calculateCopy, calculateSellCopy } from "./copy-logic.js";
@@ -22,10 +22,50 @@ export interface MonitorStats {
   running: boolean;
 }
 
+export type DashboardEvent =
+  | { type: "detect"; exec: TradeExecution }
+  | { type: "copy"; exec: TradeExecution }
+  | { type: "skip"; exec: TradeExecution }
+  | { type: "fail"; exec: TradeExecution };
+
+export type EventCallback = (event: DashboardEvent) => void;
+
+function makeSkipExecution(
+  sourceAddress: string,
+  sourceUsername: string | undefined,
+  activity: ActivityItem,
+  code: FailureCode,
+  reason: string,
+): TradeExecution {
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    sourceAddress,
+    sourceUsername,
+    sourceTrade: {
+      tokenId: activity.asset,
+      conditionId: activity.conditionId ?? "",
+      side: activity.side ?? "BUY",
+      amount: parseFloat(activity.usdcSize ?? activity.size ?? "0"),
+      price: parseFloat(activity.price ?? "0"),
+      transactionHash: activity.transactionHash,
+    },
+    status: "skipped",
+    reason,
+    failureCode: code,
+    failureDetail: { stage: code.startsWith("FILTER_") ? "filter" : "calc" },
+    market: activity.question
+      ? { slug: activity.slug ?? "", question: activity.question ?? "" }
+      : undefined,
+  };
+}
+
 export class TradeMonitor {
   private client: ClobClient;
   private config: MonitorConfig;
   private abortController: AbortController | null = null;
+  private seenSet = new Set<string>();
+  private eventListeners: EventCallback[] = [];
   private _stats: MonitorStats = {
     totalAddresses: 0,
     enabledAddresses: 0,
@@ -48,11 +88,25 @@ export class TradeMonitor {
     this.config = { ...DEFAULT_MONITOR_CONFIG, ...config };
   }
 
+  onEvent(cb: EventCallback) {
+    this.eventListeners.push(cb);
+  }
+
+  private emit(event: DashboardEvent) {
+    for (const cb of this.eventListeners) {
+      try { cb(event); } catch {}
+    }
+  }
+
   async start(): Promise<void> {
     if (this._stats.running) {
       log("warn", "Monitor is already running");
       return;
     }
+
+    const state = loadState();
+    for (const h of state.seenHashes) this.seenSet.add(h);
+    log("info", `Loaded ${this.seenSet.size} seen hashes from state`);
 
     this.abortController = new AbortController();
     this._stats.running = true;
@@ -73,6 +127,22 @@ export class TradeMonitor {
 
   stop() {
     this.abortController?.abort();
+  }
+
+  pauseAll() {
+    const addresses = loadAddresses();
+    for (const a of addresses) a.enabled = false;
+    saveAddresses(addresses);
+    this._stats.enabledAddresses = 0;
+    this._stats.pausedAddresses = addresses.length;
+  }
+
+  resumeAll() {
+    const addresses = loadAddresses();
+    for (const a of addresses) a.enabled = true;
+    saveAddresses(addresses);
+    this._stats.enabledAddresses = addresses.length;
+    this._stats.pausedAddresses = 0;
   }
 
   private async runCycle(): Promise<void> {
@@ -97,9 +167,7 @@ export class TradeMonitor {
       return now - cursor.lastActivityAt >= interval;
     });
 
-    if (due.length === 0) {
-      return;
-    }
+    if (due.length === 0) return;
 
     const limit = pLimit(this.config.concurrency);
     const tasks = due.map((addr) =>
@@ -117,14 +185,24 @@ export class TradeMonitor {
 
     const cursor = getCursor(addr.address);
     const startTs = cursor?.lastSeenTimestamp;
+    const addrLabel = addr.username ?? addr.nickname ?? addr.address.slice(0, 10);
 
     let activities: ActivityItem[];
     try {
       activities = await fetchActivity(addr.address, startTs);
     } catch (err: any) {
-      if (err.message === "RATE_LIMITED") {
-        log("warn", `Rate limited polling ${addr.nickname ?? addr.address.slice(0, 10)}...`);
+      const msg = err.message ?? String(err);
+      let code: FailureCode;
+      if (msg === "RATE_LIMITED") {
+        code = "POLL_RATE_LIMITED";
+        log("warn", `Rate limited polling ${addrLabel}...`, { source: addr.address, code });
         await this.sleep(5000);
+      } else if (msg.includes("timeout") || msg.includes("Timeout")) {
+        code = "POLL_TIMEOUT";
+        log("error", `Timeout polling ${addrLabel}: ${msg}`, { source: addr.address, code });
+      } else {
+        code = "POLL_API_ERROR";
+        log("error", `API error polling ${addrLabel}: ${msg}`, { source: addr.address, code, rawError: msg });
       }
       return;
     }
@@ -141,7 +219,14 @@ export class TradeMonitor {
 
       if (activity.timestamp > maxTs) maxTs = activity.timestamp;
 
-      if (!activity.transactionHash || isSeen(activity.transactionHash)) continue;
+      if (!activity.transactionHash) continue;
+      if (this.seenSet.has(activity.transactionHash)) continue;
+      if (isSeen(activity.transactionHash)) {
+        this.seenSet.add(activity.transactionHash);
+        continue;
+      }
+
+      this.seenSet.add(activity.transactionHash);
       markSeen(activity.transactionHash);
 
       this._stats.tradesDetected++;
@@ -157,40 +242,63 @@ export class TradeMonitor {
       const filterResult = applyFilters(addr, activity, market);
       if (!filterResult.pass) {
         this._stats.tradesSkipped++;
+        const skipExec = makeSkipExecution(
+          addr.address, addr.username, activity,
+          filterResult.code ?? "FILTER_MIN_TRIGGER",
+          filterResult.reason ?? "filtered",
+        );
+        appendExecution(skipExec);
+        this.emit({ type: "skip", exec: skipExec });
         log("skip",
-          `[${addr.nickname ?? addr.address.slice(0, 8)}] ${filterResult.reason} ` +
+          `[${addrLabel}] ${filterResult.reason} ` +
           `(${activity.question ?? activity.asset.slice(0, 12)}...)`,
+          { source: addr.address, code: filterResult.code },
         );
         continue;
       }
 
-      let copy;
+      let copyOutcome;
       if (isSell) {
-        copy = calculateSellCopy(addr, activity, 0);
+        copyOutcome = calculateSellCopy(addr, activity, 0);
       } else {
-        copy = calculateCopy(addr, activity);
+        copyOutcome = calculateCopy(addr, activity);
       }
 
-      if (!copy) {
+      if (!copyOutcome.ok) {
         this._stats.tradesSkipped++;
-        log("skip", `[${addr.nickname ?? addr.address.slice(0, 8)}] amount too small to copy`);
+        const skipExec = makeSkipExecution(
+          addr.address, addr.username, activity,
+          copyOutcome.failure.code,
+          copyOutcome.failure.reason,
+        );
+        appendExecution(skipExec);
+        this.emit({ type: "skip", exec: skipExec });
+        log("skip", `[${addrLabel}] ${copyOutcome.failure.reason}`, {
+          source: addr.address, code: copyOutcome.failure.code,
+        });
         continue;
       }
 
       const exec = await executeCopyTrade(
         this.client,
-        copy,
+        copyOutcome.result,
         activity,
         addr.address,
         this.config,
       );
+      exec.sourceUsername = addr.username;
 
       if (exec.status === "success") {
         this._stats.tradesExecuted++;
+        this.emit({ type: "detect", exec });
+        this.emit({ type: "copy", exec });
       } else if (exec.status === "failed") {
         this._stats.tradesFailed++;
+        this.emit({ type: "detect", exec });
+        this.emit({ type: "fail", exec });
       } else {
         this._stats.tradesSkipped++;
+        this.emit({ type: "skip", exec });
       }
     }
 

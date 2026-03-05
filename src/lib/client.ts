@@ -35,6 +35,6 @@ export function loadEnv(): ClientEnv {
 export async function initClient(env: ClientEnv): Promise<ClobClient> {
   const signer = new Wallet(env.privateKey);
   const temp = new ClobClient(HOST, CHAIN_ID, signer);
-  const creds = await temp.createOrDeriveApiKey();
+  const creds = await temp.deriveApiKey();
   return new ClobClient(HOST, CHAIN_ID, signer, creds, env.signatureType, env.funderAddress);
 }

@@ -3,6 +3,25 @@ export type SellMode = "same_pct" | "fixed" | "custom_pct" | "ignore";
 export type Priority = "fast" | "normal" | "slow";
 export type ExecutionStatus = "success" | "failed" | "skipped";
 
+export type FailureCode =
+  | "POLL_RATE_LIMITED" | "POLL_API_ERROR" | "POLL_TIMEOUT" | "POLL_PARSE_ERROR"
+  | "FILTER_MIN_TRIGGER" | "FILTER_MAX_ODDS" | "FILTER_MAX_PER_MARKET"
+  | "FILTER_MAX_DAYS_OUT" | "FILTER_SELL_IGNORED"
+  | "CALC_AMOUNT_TOO_SMALL" | "CALC_ZERO_ORIGINAL" | "CALC_NO_POSITION"
+  | "SLIPPAGE_TOO_HIGH" | "SLIPPAGE_PRICE_UNAVAILABLE"
+  | "EXEC_INSUFFICIENT_BALANCE" | "EXEC_FOK_NOT_FILLED"
+  | "EXEC_API_ERROR" | "EXEC_NETWORK_ERROR";
+
+export interface FailureDetail {
+  stage: "poll" | "filter" | "calc" | "slippage" | "exec";
+  attempts?: number;
+  currentPrice?: number;
+  sourcePrice?: number;
+  slippagePct?: number;
+  rawError?: string;
+  apiResponse?: unknown;
+}
+
 export interface Filters {
   minTrigger?: number;
   maxOdds?: number;
@@ -15,6 +34,7 @@ export interface Filters {
 
 export interface FollowedAddress {
   address: string;
+  username?: string;
   nickname?: string;
   enabled: boolean;
   copyMode: CopyMode;
@@ -58,10 +78,14 @@ export interface TradeExecution {
   id: string;
   timestamp: string;
   sourceAddress: string;
+  sourceUsername?: string;
   sourceTrade: SourceTrade;
   executedTrade?: ExecutedTrade;
   status: ExecutionStatus;
   reason?: string;
+  failureCode?: FailureCode;
+  failureDetail?: FailureDetail;
+  latencyMs?: number;
   market?: { slug: string; question: string };
 }
 
