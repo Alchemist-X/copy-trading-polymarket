@@ -89,12 +89,22 @@ export class Dashboard {
   }
 
   private handleEvent(ev: DashboardEvent) {
+    const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
+
+    if (ev.type === "redeem") {
+      const r = ev.redeem;
+      const market = (r.question ?? r.conditionId).slice(0, 30);
+      this.pushLog(
+        `${chalk.dim(time)} ${chalk.green.bold("REDEEM")} ${chalk.dim(market)}  tx:${r.txHash.slice(0, 10)}..`
+      );
+      return;
+    }
+
     const exec = ev.exec;
     const who = fmtWho(exec.sourceUsername, exec.sourceAddress);
     const side = exec.sourceTrade.side;
     const amt = exec.sourceTrade.amount.toFixed(2);
     const market = (exec.market?.question ?? exec.sourceTrade.tokenId).slice(0, 24);
-    const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
 
     switch (ev.type) {
       case "detect":

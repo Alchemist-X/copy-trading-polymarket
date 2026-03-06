@@ -123,6 +123,19 @@ export interface ActivityItem {
   question?: string;
 }
 
+export interface RedeemRecord {
+  conditionId: string;
+  tokenId: string;
+  amount: string;
+  txHash: string;
+  question?: string;
+  timestamp: string;
+}
+
+export interface RedeemsStore {
+  redeemed: RedeemRecord[];
+}
+
 export interface MonitorConfig {
   concurrency: number;
   fastIntervalMs: number;
@@ -131,6 +144,8 @@ export interface MonitorConfig {
   maxSlippagePct: number;
   maxRetries: number;
   dryRun: boolean;
+  autoRedeem: boolean;
+  redeemIntervalMs: number;
 }
 
 export const DEFAULT_MONITOR_CONFIG: MonitorConfig = {
@@ -141,6 +156,8 @@ export const DEFAULT_MONITOR_CONFIG: MonitorConfig = {
   maxSlippagePct: 0.05,
   maxRetries: 3,
   dryRun: false,
+  autoRedeem: true,
+  redeemIntervalMs: 60_000,
 };
 
 export const DEFAULT_FILTERS: Filters = {

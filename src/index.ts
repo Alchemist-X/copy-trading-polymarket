@@ -32,6 +32,7 @@ program
   .option("--concurrency <n>", "Max concurrent API requests", "15")
   .option("--verbose", "Enable verbose logging", false)
   .option("--no-dashboard", "Disable live dashboard")
+  .option("--no-auto-redeem", "Disable auto-redeem of resolved markets")
   .action(async (opts) => {
     setVerbose(opts.verbose);
     if (opts.dashboard !== false) setDashboardMode(true);
@@ -47,7 +48,8 @@ program
     const monitor = new TradeMonitor(client, {
       dryRun: opts.dryRun,
       concurrency: parseInt(opts.concurrency),
-    });
+      autoRedeem: opts.autoRedeem !== false,
+    }, env.privateKey);
 
     if (opts.dryRun) {
       log("warn", "DRY RUN mode - no real trades will be executed");

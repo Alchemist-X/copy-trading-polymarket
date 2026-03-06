@@ -8,6 +8,8 @@ import { calculateCopy, calculateSellCopy } from "./copy-logic.js";
 import { applyFilters } from "./filters.js";
 import { executeCopyTrade } from "./executor.js";
 import pLimit from "p-limit";
+import { AutoRedeemer } from "./redeemer.js";
+import type { RedeemEvent } from "./redeemer.js";
 
 export interface MonitorStats {
   totalAddresses: number;
@@ -26,7 +28,8 @@ export type DashboardEvent =
   | { type: "detect"; exec: TradeExecution }
   | { type: "copy"; exec: TradeExecution }
   | { type: "skip"; exec: TradeExecution }
-  | { type: "fail"; exec: TradeExecution };
+  | { type: "fail"; exec: TradeExecution }
+  | { type: "redeem"; redeem: RedeemEvent };
 
 export type EventCallback = (event: DashboardEvent) => void;
 
@@ -63,9 +66,11 @@ function makeSkipExecution(
 export class TradeMonitor {
   private client: ClobClient;
   private config: MonitorConfig;
+  private privateKey: string;
   private abortController: AbortController | null = null;
   private seenSet = new Set<string>();
   private eventListeners: EventCallback[] = [];
+  private redeemer: AutoRedeemer | null = null;
   private _stats: MonitorStats = {
     totalAddresses: 0,
     enabledAddresses: 0,
@@ -83,9 +88,10 @@ export class TradeMonitor {
     return this._stats;
   }
 
-  constructor(client: ClobClient, config?: Partial<MonitorConfig>) {
+  constructor(client: ClobClient, config?: Partial<MonitorConfig>, privateKey?: string) {
     this.client = client;
     this.config = { ...DEFAULT_MONITOR_CONFIG, ...config };
+    this.privateKey = privateKey ?? "";
   }
 
   onEvent(cb: EventCallback) {
@@ -112,6 +118,13 @@ export class TradeMonitor {
     this._stats.running = true;
     log("info", `Monitor started (concurrency=${this.config.concurrency}, dryRun=${this.config.dryRun})`);
 
+    if (this.config.autoRedeem && this.privateKey) {
+      this.redeemer = new AutoRedeemer(this.client, this.config, this.privateKey);
+      this.redeemer.onRedeem((ev) => this.emit({ type: "redeem", redeem: ev }));
+      this.redeemer.start();
+      log("info", `AutoRedeemer enabled (interval=${this.config.redeemIntervalMs}ms)`);
+    }
+
     while (!this.abortController.signal.aborted) {
       try {
         await this.runCycle();
@@ -126,6 +139,7 @@ export class TradeMonitor {
   }
 
   stop() {
+    this.redeemer?.stop();
     this.abortController?.abort();
   }
 

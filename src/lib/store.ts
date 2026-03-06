@@ -3,9 +3,11 @@ import { join, dirname } from "path";
 import type {
   AddressesStore,
   HistoryStore,
+  RedeemsStore,
   MonitorState,
   FollowedAddress,
   TradeExecution,
+  RedeemRecord,
 } from "../types/index.js";
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -125,4 +127,20 @@ export function appendExecution(exec: TradeExecution) {
     store.executions = store.executions.slice(-MAX_HISTORY);
   }
   writeJSON("history.json", store);
+}
+
+// ---------- Redeems ----------
+
+export function loadRedeems(): RedeemRecord[] {
+  return readJSON<RedeemsStore>("redeems.json", { redeemed: [] }).redeemed;
+}
+
+export function isRedeemed(conditionId: string): boolean {
+  return loadRedeems().some((r) => r.conditionId === conditionId);
+}
+
+export function appendRedeem(record: RedeemRecord) {
+  const store = readJSON<RedeemsStore>("redeems.json", { redeemed: [] });
+  store.redeemed.push(record);
+  writeJSON("redeems.json", store);
 }

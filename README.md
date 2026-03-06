@@ -161,6 +161,43 @@ Poll Activity API (per address, incremental)
 
 ---
 
+## Testing
+
+This repo uses a three-layer workflow:
+
+1. Fast local checks on every change
+2. Module regression checks for risky logic
+3. Release-gated live E2E with small real funds
+
+Fast checks:
+
+```bash
+npm run typecheck
+npm run smoke:commands
+npm run smoke:logs
+```
+
+If you changed runtime behavior, also run:
+
+```bash
+npx tsx src/index.ts start --dry-run --no-dashboard
+```
+
+Testing docs:
+
+- `docs/testing-workflow.md` - full workflow and release gate
+- `docs/test-runs/latest.md` - latest rolling test result
+- `docs/test-runs/report-template.md` - per-change delivery template
+- `docs/ui-mockups.md` - dashboard state baseline
+
+UI rule:
+
+- Every terminal/dashboard change should ship with screenshots
+- Use state IDs `A` through `H` from `docs/ui-mockups.md`
+- Attach the screenshots in a markdown test report
+
+---
+
 ## Data Files
 
 Stored in `data/` (gitignored):

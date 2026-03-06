@@ -203,3 +203,34 @@ Events appear as SKIP with reason "dry run".
 ║  [q]Quit [1/2]Tab [%]Copy% [L]Limits [Space]Pause                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
+
+---
+
+## H. Auto-Redeem events
+
+When a resolved market is detected and tokens are redeemed, a REDEEM
+event appears in the activity feed. Auto-redeem runs every 60s by default.
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  Polymarket Copy Trading Monitor                        Cycle #120 ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  ● RUNNING    USDC: $162.85    Latency: 45ms                       ║
+║  Addresses: 3 active / 0 paused                                    ║
+║  Trades: 15 detected  12 executed  2 skipped  1 failed             ║
+╠══ 1 Activity ══ 2 Monitor ══════════════════════════════════════════╣
+║                                                                     ║
+║  17:23:01 DETECT Hustle (0x5334...a8D6) BUY $100.00  Will Trump.. ║
+║  17:23:02 COPY   BUY $50.00 @ 0.42  Will Trump win 2028?           ║
+║  17:30:00 REDEEM Will Trump win 2028?  tx:0xa3f2b1..              ║
+║  17:31:00 REDEEM Bitcoin above 200k by 2027?  tx:0x8c1d..         ║
+║                                                                     ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  [q]Quit [1/2]Tab [%]Copy% [L]Limits [Space]Pause                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+REDEEM events are shown in green bold. The display format is:
+`HH:MM:SS REDEEM <market question (truncated)>  tx:<hash prefix>..`
+
+Disable with `--no-auto-redeem` flag.

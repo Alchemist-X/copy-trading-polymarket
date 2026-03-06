@@ -4,8 +4,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "start": "tsx src/index.ts start",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "smoke:commands": "tsx src/index.ts --help && tsx src/index.ts list && tsx src/index.ts status",
+    "smoke:logs": "tsx src/index.ts logs --commands",
+    "test:base": "npm run typecheck && npm run smoke:commands && npm run smoke:logs"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.0.0",
