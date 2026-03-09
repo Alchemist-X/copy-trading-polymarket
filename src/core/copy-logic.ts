@@ -63,7 +63,8 @@ export function calculateCopy(
 export function calculateSellCopy(
   config: FollowedAddress,
   activity: ActivityItem,
-  myPositionSize: number,
+  myPositionShares: number,
+  myPositionValueUsdc: number,
 ): CopyOutcome {
   const { sellMode, sellAmount } = config.filters;
   if (sellMode === "ignore") {
@@ -75,29 +76,32 @@ export function calculateSellCopy(
     return { ok: false, failure: { code: "CALC_ZERO_ORIGINAL", reason: `original sell amount ${originalAmount} <= 0` } };
   }
 
-  if (myPositionSize <= 0) {
-    return { ok: false, failure: { code: "CALC_NO_POSITION", reason: `no position to sell (size=${myPositionSize})` } };
+  if (myPositionShares <= 0 || myPositionValueUsdc <= 0) {
+    return {
+      ok: false,
+      failure: {
+        code: "CALC_NO_POSITION",
+        reason: `no position to sell (shares=${myPositionShares}, value=${myPositionValueUsdc})`,
+      },
+    };
   }
 
   let amount: number;
 
   switch (sellMode) {
     case "same_pct": {
-      const originalSize = parseFloat(activity.size ?? "0");
-      if (originalSize <= 0) {
-        return { ok: false, failure: { code: "CALC_ZERO_ORIGINAL", reason: `original size is 0 for same_pct` } };
-      }
-      const pct = originalAmount / originalSize;
-      amount = myPositionSize * Math.min(pct, 1);
+      const mirrored = calculateCopy({ ...config, counterMode: config.counterMode }, activity);
+      if (!mirrored.ok) return mirrored;
+      amount = Math.min(myPositionValueUsdc, mirrored.result.amount);
       break;
     }
     case "fixed": {
-      amount = sellAmount ?? 5;
+      amount = Math.min(myPositionValueUsdc, sellAmount ?? 5);
       break;
     }
     case "custom_pct": {
       const pct = sellAmount ?? 0.25;
-      amount = myPositionSize * pct;
+      amount = myPositionValueUsdc * pct;
       break;
     }
     default:

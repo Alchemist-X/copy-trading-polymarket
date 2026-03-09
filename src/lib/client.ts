@@ -1,10 +1,8 @@
-import dotenv from "dotenv";
-dotenv.config({ path: ".env" });
-
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
+import { getConfig, getRequiredClientConfig } from "./config.js";
 
-export const HOST = "https://clob.polymarket.com";
+export const HOST = getConfig().clobHost;
 export const CHAIN_ID = 137;
 
 export interface ClientEnv {
@@ -15,20 +13,12 @@ export interface ClientEnv {
 }
 
 export function loadEnv(): ClientEnv {
-  const privateKey = process.env.PRIVATE_KEY ?? "";
-  const funderAddress = process.env.FUNDER_ADDRESS ?? "";
-  const signatureType = parseInt(process.env.SIGNATURE_TYPE ?? "1", 10);
-
-  if (!privateKey || !funderAddress) {
-    console.error("Missing PRIVATE_KEY or FUNDER_ADDRESS in .env");
-    process.exit(1);
-  }
-
+  const cfg = getRequiredClientConfig();
   return {
-    privateKey,
-    funderAddress,
-    signatureType,
-    eoaAddress: new Wallet(privateKey).address,
+    privateKey: cfg.privateKey,
+    funderAddress: cfg.funderAddress,
+    signatureType: cfg.signatureType,
+    eoaAddress: new Wallet(cfg.privateKey).address,
   };
 }
 

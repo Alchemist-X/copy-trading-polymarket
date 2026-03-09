@@ -4,6 +4,7 @@ import type { CopyResult } from "./copy-logic.js";
 import type { TradeExecution, ActivityItem, MonitorConfig, FailureCode, FailureDetail } from "../types/index.js";
 import { appendExecution } from "../lib/store.js";
 import { log } from "../lib/logger.js";
+import { sendAlert } from "../lib/alerts.js";
 import { fetchTokenPrice } from "../lib/polymarket-api.js";
 
 function sleep(ms: number) {
@@ -15,6 +16,8 @@ function classifyError(err: string): FailureCode {
   if (lower.includes("insufficient") || lower.includes("balance") || lower.includes("allowance"))
     return "EXEC_INSUFFICIENT_BALANCE";
   if (lower.includes("fok") || lower.includes("not filled") || lower.includes("no fill"))
+    return "EXEC_FOK_NOT_FILLED";
+  if (lower.includes("no match"))
     return "EXEC_FOK_NOT_FILLED";
   if (lower.includes("timeout") || lower.includes("econnrefused") || lower.includes("enotfound") || lower.includes("network"))
     return "EXEC_NETWORK_ERROR";
@@ -112,6 +115,7 @@ export async function executeCopyTrade(
       );
 
       if (resp.orderID || resp.success) {
+        const shares = currentPrice > 0 ? copy.amount / currentPrice : undefined;
         execution.status = "success";
         execution.executedTrade = {
           tokenId: copy.tokenId,
@@ -119,6 +123,8 @@ export async function executeCopyTrade(
           amount: copy.amount,
           price: currentPrice,
           orderId: resp.orderID ?? "",
+          shares,
+          proceeds: copy.side === "SELL" ? copy.amount : undefined,
         };
         execution.latencyMs = Date.now() - t0;
         log("trade",
@@ -156,6 +162,19 @@ export async function executeCopyTrade(
   log("error", `Failed to execute ${copy.side} $${copy.amount}: ${lastError}`, {
     source: sourceAddress, code: failureCode, attempts, rawError: lastError,
   });
+  if (failureCode === "EXEC_INSUFFICIENT_BALANCE") {
+    await sendAlert({
+      key: "balance:insufficient",
+      severity: "warn",
+      title: "Trade execution failed: insufficient balance",
+      body: [
+        `Source: ${sourceAddress}`,
+        `Trade: ${copy.side} $${copy.amount}`,
+        `Attempts: ${attempts}`,
+        `Error: ${lastError}`,
+      ].join("\n"),
+    });
+  }
   appendExecution(execution);
   return execution;
 }

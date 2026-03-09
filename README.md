@@ -24,7 +24,8 @@ Follow someone, then start:
 
 ```bash
 npx tsx src/index.ts add 0xSOME_TRADER_ADDRESS
-npx tsx src/index.ts start
+npm run build
+node dist/index.js start
 ```
 
 That's it. You're copy trading.
@@ -86,11 +87,21 @@ Real-time features:
 | `start --dry-run` | Simulate without real trades |
 | `history` | View past executions |
 | `status` | Engine status snapshot |
+| `risk status` | Current net equity + source/global risk snapshot |
+| `risk reset global` | Clear the global risk latch manually |
+| `alerts test` | Send test alerts to Telegram / Email |
 | `verify <address>` | Check if address is a valid Polymarket trader |
 | `import <file>` | Bulk import from CSV or JSON |
 | `logs` | View engine logs |
 
 All commands: `npx tsx src/index.ts <command>`
+
+Production start:
+
+```bash
+npm run build
+node dist/index.js start --no-dashboard
+```
 
 You can use Polymarket **usernames** (e.g. `Hunter-Biden`) anywhere an address is expected. The system resolves them automatically.
 
@@ -126,7 +137,7 @@ Set during `add` or `edit`:
 
 ```
 Poll Activity API (per address, incremental)
-  → Detect new trade (dedup by tx hash, in-memory + file)
+  → Detect new trade (dedup by tx hash, in-memory + SQLite)
   → Apply filters (minTrigger, maxOdds, etc.)
   → Calculate copy amount (percentage/fixed/range)
   → Check slippage (default max 5%)
@@ -149,6 +160,12 @@ Poll Activity API (per address, incremental)
 | `PRIVATE_KEY` | Your wallet private key |
 | `FUNDER_ADDRESS` | Polymarket proxy wallet (Settings > Proxy Wallet on polymarket.com) |
 | `SIGNATURE_TYPE` | `0` = EOA, `1` = proxy (typical), `2` = Gnosis Safe |
+| `POLYGON_RPC_URL` | Preferred Polygon RPC endpoint for balance/redeem/risk valuation |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | Telegram alert bot |
+| `ALERT_EMAIL_TO` + SMTP vars | Email alert delivery |
+| `RISK_SOURCE_STOP_PCT` | Per-source stop threshold, default `0.20` |
+| `RISK_GLOBAL_STOP_PCT` | Global stop threshold, default `0.30` |
+| `HEARTBEAT_FILE` | JSON heartbeat file path for external monitoring |
 
 ### `start` options
 
@@ -204,9 +221,9 @@ Stored in `data/` (gitignored):
 
 | File | Contents |
 |------|----------|
-| `addresses.json` | Followed addresses + config |
-| `state.json` | Poll cursors, seen tx hashes |
-| `history.json` | Execution history (max 10k) |
+| `copy-trade.db` | SQLite database (addresses, state, executions, redeems, risk, alerts) |
+| `heartbeat.json` | Optional heartbeat file for systemd/external checks |
+| `addresses.json` / `state.json` / `history.json` | Legacy JSON import source, kept read-only after first DB import |
 
 Logs in `logs/`:
 
@@ -233,16 +250,22 @@ src/
 │   └── filters.ts           # Trade filter chain
 ├── lib/
 │   ├── client.ts            # CLOB client init
+│   ├── config.ts            # Runtime/deploy configuration
+│   ├── db.ts                # SQLite bootstrap (WAL)
+│   ├── alerts.ts            # Telegram / Email alerting
+│   ├── http.ts              # Timeout + retry + endpoint health
+│   ├── logger.ts            # Console + file logging
 │   ├── polymarket-api.ts    # Activity/Gamma/Price APIs + USDC balance + latency
-│   ├── store.ts             # JSON persistence
-│   └── logger.ts            # Console + file logging
+│   └── store.ts             # SQLite persistence + migration
+├── deploy/
+│   └── copy-trade.service   # systemd unit template
 └── types/
     └── index.ts             # TypeScript types
 ```
 
 ## Tech Stack
 
-`@polymarket/clob-client` / `ethers` / `commander` / `chalk` / `p-limit` / `dotenv`
+`@polymarket/clob-client` / `ethers` / `better-sqlite3` / `nodemailer` / `commander` / `chalk` / `p-limit` / `dotenv`
 
 ## License
 

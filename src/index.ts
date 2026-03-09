@@ -4,11 +4,16 @@ import { loadEnv, initClient } from "./lib/client.js";
 import { setVerbose, setDashboardMode, log } from "./lib/logger.js";
 import { TradeMonitor } from "./core/monitor.js";
 import { Dashboard } from "./cli/dashboard.js";
+import { sendAlert } from "./lib/alerts.js";
+import { updateServiceHeartbeat } from "./lib/store.js";
 import {
   addCommand,
+  alertsTestCommand,
   listCommand,
   editCommand,
   pauseCommand,
+  riskResetGlobalCommand,
+  riskStatusCommand,
   resumeCommand,
   removeCommand,
   historyCommand,
@@ -49,7 +54,7 @@ program
       dryRun: opts.dryRun,
       concurrency: parseInt(opts.concurrency),
       autoRedeem: opts.autoRedeem !== false,
-    }, env.privateKey);
+    }, env.privateKey, env.funderAddress);
 
     if (opts.dryRun) {
       log("warn", "DRY RUN mode - no real trades will be executed");
@@ -64,12 +69,53 @@ program
       monitor.stop();
     });
 
+    process.on("unhandledRejection", async (reason: any) => {
+      const msg = reason instanceof Error ? reason.stack ?? reason.message : String(reason);
+      log("error", `Unhandled rejection: ${msg}`);
+      updateServiceHeartbeat({
+        status: "error",
+        lastErrorAt: new Date().toISOString(),
+        note: `unhandledRejection: ${msg}`,
+      });
+      await sendAlert({
+        key: "process:unhandled-rejection",
+        severity: "critical",
+        title: "Unhandled rejection",
+        body: msg,
+      });
+    });
+
+    process.on("uncaughtException", async (err: Error) => {
+      const msg = err.stack ?? err.message;
+      log("error", `Uncaught exception: ${msg}`);
+      updateServiceHeartbeat({
+        status: "error",
+        lastErrorAt: new Date().toISOString(),
+        note: `uncaughtException: ${err.message}`,
+      });
+      await sendAlert({
+        key: "process:uncaught-exception",
+        severity: "critical",
+        title: "Uncaught exception",
+        body: msg,
+      });
+      process.exit(1);
+    });
+
     if (opts.dashboard !== false) {
       const dashboard = new Dashboard(monitor, env.funderAddress);
       dashboard.start();
     }
 
-    await monitor.start();
+    try {
+      await monitor.start();
+    } catch (err: any) {
+      if (err.message === "GLOBAL_RISK_LATCHED") {
+        console.error(chalk.red("Global risk latch is active. Run `copy-trade risk reset global` before restarting."));
+        process.exit(78);
+      }
+      throw err;
+    }
   });
 
 program
@@ -112,6 +158,29 @@ program
   .command("status")
   .description("Show current engine status")
   .action(statusCommand);
+
+const risk = program
+  .command("risk")
+  .description("Risk management commands");
+
+risk
+  .command("status")
+  .description("Show current risk snapshot")
+  .action(riskStatusCommand);
+
+risk
+  .command("reset <scope>")
+  .description("Reset risk latch (currently supports: global)")
+  .action(riskResetGlobalCommand);
+
+const alerts = program
+  .command("alerts")
+  .description("Alert channel commands");
+
+alerts
+  .command("test")
+  .description("Send a test alert to configured channels")
+  .action(alertsTestCommand);
 
 program
   .command("import <file>")

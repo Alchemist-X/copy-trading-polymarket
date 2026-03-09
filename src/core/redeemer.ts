@@ -1,10 +1,12 @@
 import type { ClobClient } from "@polymarket/clob-client";
 import { ethers } from "ethers";
 import type { MonitorConfig, RedeemRecord } from "../types/index.js";
-import { loadHistory, isRedeemed, appendRedeem } from "../lib/store.js";
+import { loadHistory, isRedeemed, appendRedeem, updateServiceHeartbeat } from "../lib/store.js";
 import { log } from "../lib/logger.js";
+import { sendAlert } from "../lib/alerts.js";
+import { getConfig } from "../lib/config.js";
+import { apiPolicy, requestJson } from "../lib/http.js";
 
-const POLYGON_RPC = "https://polygon-bor-rpc.publicnode.com";
 const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const CTF_ABI = [
@@ -110,9 +112,10 @@ export class AutoRedeemer {
 
   private async isMarketResolved(conditionId: string): Promise<boolean> {
     try {
-      const res = await fetch(`https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`);
-      if (!res.ok) return false;
-      const data: any[] = await res.json();
+      const data = await requestJson<any[]>(
+        `${getConfig().gammaApiUrl}/markets?condition_id=${conditionId}`,
+        apiPolicy("gamma:redeemer-markets"),
+      );
       if (!data.length) return false;
       return data[0].resolved === true || data[0].closed === true;
     } catch {
@@ -126,16 +129,16 @@ export class AutoRedeemer {
     let tokenIds: string[] = [];
     let marketQuestion = question ?? "";
     try {
-      const res = await fetch(`https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`);
-      if (res.ok) {
-        const data: any[] = await res.json();
-        if (data.length) {
-          const m = data[0];
-          marketQuestion = marketQuestion || m.question || "";
-          const ids = m.clobTokenIds;
-          if (Array.isArray(ids)) tokenIds = ids;
-          else if (typeof ids === "string") { try { tokenIds = JSON.parse(ids); } catch {} }
-        }
+      const data = await requestJson<any[]>(
+        `${getConfig().gammaApiUrl}/markets?condition_id=${conditionId}`,
+        apiPolicy("gamma:redeemer-markets"),
+      );
+      if (data.length) {
+        const m = data[0];
+        marketQuestion = marketQuestion || m.question || "";
+        const ids = m.clobTokenIds;
+        if (Array.isArray(ids)) tokenIds = ids;
+        else if (typeof ids === "string") { try { tokenIds = JSON.parse(ids); } catch {} }
       }
     } catch {}
 
@@ -173,7 +176,7 @@ export class AutoRedeemer {
     }
 
     try {
-      const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC);
+      const provider = new ethers.providers.JsonRpcProvider(getConfig().polygonRpcUrl);
       const signer = new ethers.Wallet(this.privateKey, provider);
       const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, signer);
 
@@ -198,9 +201,20 @@ export class AutoRedeemer {
       };
       appendRedeem(record);
       log("info", `Redeemed condition ${conditionId.slice(0, 10)}... tx: ${txHash}`);
+      updateServiceHeartbeat({ lastRedeemAt: new Date().toISOString() });
       this.emit({ conditionId, question: marketQuestion, amount: "redeemed", txHash });
     } catch (err: any) {
       log("error", `Redeem failed for ${conditionId.slice(0, 10)}...: ${err.message}`);
+      await sendAlert({
+        key: `redeem:failed:${conditionId}`,
+        severity: "warn",
+        title: "Auto redeem failed",
+        body: [
+          `Condition: ${conditionId}`,
+          `Question: ${marketQuestion || "unknown"}`,
+          `Error: ${err.message ?? String(err)}`,
+        ].join("\n"),
+      });
     }
   }
 }

@@ -37,6 +37,9 @@ export interface FollowedAddress {
   username?: string;
   nickname?: string;
   enabled: boolean;
+  pauseReason?: string;
+  riskPausedAt?: string;
+  riskNote?: string;
   copyMode: CopyMode;
   counterMode: boolean;
   percentage?: number;
@@ -63,6 +66,8 @@ export interface ExecutedTrade {
   amount: number;
   price: number;
   orderId: string;
+  shares?: number;
+  proceeds?: number;
 }
 
 export interface MarketInfo {
@@ -98,6 +103,9 @@ export interface MonitorState {
   cursors: Record<string, AddressCursor>;
   seenHashes: string[];
   startedAt?: string;
+  globalStopLatched?: boolean;
+  globalStopAt?: string;
+  globalStopReason?: string;
 }
 
 export interface AddressesStore {
@@ -146,6 +154,8 @@ export interface MonitorConfig {
   dryRun: boolean;
   autoRedeem: boolean;
   redeemIntervalMs: number;
+  riskCheckIntervalMs: number;
+  lowUsdcAlertThreshold: number;
 }
 
 export const DEFAULT_MONITOR_CONFIG: MonitorConfig = {
@@ -158,8 +168,87 @@ export const DEFAULT_MONITOR_CONFIG: MonitorConfig = {
   dryRun: false,
   autoRedeem: true,
   redeemIntervalMs: 60_000,
+  riskCheckIntervalMs: 60_000,
+  lowUsdcAlertThreshold: 25,
 };
 
 export const DEFAULT_FILTERS: Filters = {
   sellMode: "same_pct",
 };
+
+export interface SourcePosition {
+  sourceAddress: string;
+  tokenId: string;
+  conditionId: string;
+  marketSlug?: string;
+  marketQuestion?: string;
+  netShares: number;
+  costBasisUsdc: number;
+  realizedPnlUsdc: number;
+  lastPrice?: number;
+  lastValueUsdc?: number;
+  lastValuedAt?: string;
+  updatedAt: string;
+}
+
+export interface SourceRiskStatus {
+  sourceAddress: string;
+  baselineCostUsdc: number;
+  currentValueUsdc: number;
+  realizedPnlUsdc: number;
+  unrealizedPnlUsdc: number;
+  totalPnlUsdc: number;
+  lossPct: number;
+  riskPaused: boolean;
+  riskPausedAt?: string;
+  note?: string;
+}
+
+export interface GlobalRiskState {
+  baselineEquityUsdc: number;
+  currentEquityUsdc: number;
+  lossPct: number;
+  latched: boolean;
+  latchedAt?: string;
+  reason?: string;
+  lastEvaluatedAt?: string;
+}
+
+export interface ServiceHeartbeat {
+  serviceName: string;
+  pid?: number;
+  status: "starting" | "running" | "stopped" | "error" | "risk_latched";
+  startedAt?: string;
+  lastCycleAt?: string;
+  lastSuccessfulPollAt?: string;
+  lastErrorAt?: string;
+  lastRedeemAt?: string;
+  lastRiskCheckAt?: string;
+  lastAlertTestAt?: string;
+  note?: string;
+  globalStopLatched: boolean;
+  globalStopAt?: string;
+  globalStopReason?: string;
+}
+
+export interface AlertEvent {
+  id?: number;
+  alertKey: string;
+  channel: "telegram" | "email";
+  severity: "info" | "warn" | "critical";
+  title: string;
+  body: string;
+  sentAt?: string;
+  dedupeUntil?: string;
+  status: "sent" | "skipped" | "failed";
+  error?: string;
+}
+
+export interface EndpointHealth {
+  endpoint: string;
+  consecutiveFailures: number;
+  degraded: boolean;
+  lastErrorAt?: string;
+  lastSuccessAt?: string;
+  lastError?: string;
+}

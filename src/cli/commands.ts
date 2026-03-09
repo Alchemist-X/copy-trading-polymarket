@@ -3,17 +3,24 @@ import ora from "ora";
 import { createInterface } from "readline";
 import { readFileSync, existsSync } from "fs";
 import {
+  clearGlobalRiskLatch,
   loadAddresses,
   saveAddresses,
   upsertAddress,
   removeAddress,
   findAddress,
+  getGlobalRiskState,
+  getServiceHeartbeat,
   loadHistory,
+  listSourceRiskStatuses,
 } from "../lib/store.js";
-import { verifyAddress, resolveInput, searchProfiles } from "../lib/polymarket-api.js";
+import { verifyAddress, searchProfiles } from "../lib/polymarket-api.js";
 import { logCommand, getLogPath } from "../lib/logger.js";
+import { testAlerts } from "../lib/alerts.js";
+import { getConfig } from "../lib/config.js";
 import type { FollowedAddress, CopyMode, Priority, SellMode } from "../types/index.js";
-import { DEFAULT_FILTERS } from "../types/index.js";
+import { DEFAULT_FILTERS, DEFAULT_MONITOR_CONFIG } from "../types/index.js";
+import { RiskManager } from "../core/risk-manager.js";
 
 function prompt(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -137,6 +144,15 @@ function printProfile(address: string, profile: Awaited<ReturnType<typeof verify
   }
 
   console.log();
+}
+
+function fmtAgo(iso?: string): string {
+  if (!iso) return "—";
+  const diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60_000) return `${Math.max(0, Math.floor(diff / 1000))}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
 export async function addCommand(input: string) {
@@ -369,7 +385,11 @@ export function pauseCommand(target: string) {
     const all = loadAddresses();
     let count = 0;
     for (const a of all) {
-      if (a.enabled) { a.enabled = false; count++; }
+      if (a.enabled) {
+        a.enabled = false;
+        a.pauseReason = "manual";
+        count++;
+      }
     }
     saveAddresses(all);
     console.log(chalk.yellow(`Paused ${count} address(es)`));
@@ -384,6 +404,7 @@ export function pauseCommand(target: string) {
     return;
   }
   entry.enabled = false;
+  entry.pauseReason = "manual";
   upsertAddress(entry);
   console.log(chalk.yellow(`Paused ${entry.nickname ?? entry.username ?? entry.address.slice(0, 10)}`));
   logCommand("pause", [target], "ok", { address: entry.address });
@@ -394,7 +415,13 @@ export function resumeCommand(target: string) {
     const all = loadAddresses();
     let count = 0;
     for (const a of all) {
-      if (!a.enabled) { a.enabled = true; count++; }
+      if (!a.enabled) {
+        a.enabled = true;
+        a.pauseReason = undefined;
+        a.riskPausedAt = undefined;
+        a.riskNote = undefined;
+        count++;
+      }
     }
     saveAddresses(all);
     console.log(chalk.green(`Resumed ${count} address(es)`));
@@ -409,6 +436,9 @@ export function resumeCommand(target: string) {
     return;
   }
   entry.enabled = true;
+  entry.pauseReason = undefined;
+  entry.riskPausedAt = undefined;
+  entry.riskNote = undefined;
   upsertAddress(entry);
   console.log(chalk.green(`Resumed ${entry.nickname ?? entry.username ?? entry.address.slice(0, 10)}`));
   logCommand("resume", [target], "ok", { address: entry.address });
@@ -468,6 +498,9 @@ export function statusCommand() {
   const addresses = loadAddresses();
   const history = loadHistory();
   const recent = history.slice(-100);
+  const heartbeat = getServiceHeartbeat();
+  const globalRisk = getGlobalRiskState();
+  const sourceRisks = listSourceRiskStatuses().filter((risk) => risk.riskPaused || risk.lossPct > 0);
 
   const success = recent.filter((e) => e.status === "success").length;
   const failed = recent.filter((e) => e.status === "failed").length;
@@ -477,15 +510,89 @@ export function statusCommand() {
   console.log(`  Followed addresses: ${chalk.white(String(addresses.length))}`);
   console.log(`  Active:            ${chalk.green(String(addresses.filter((a) => a.enabled).length))}`);
   console.log(`  Paused:            ${chalk.yellow(String(addresses.filter((a) => !a.enabled).length))}`);
+  console.log(`  Service status:    ${heartbeat.status}`);
+  console.log(`  Last cycle:        ${chalk.dim(fmtAgo(heartbeat.lastCycleAt))}`);
+  console.log(`  Last good poll:    ${chalk.dim(fmtAgo(heartbeat.lastSuccessfulPollAt))}`);
   console.log(`  Total executions:  ${chalk.white(String(history.length))}`);
   console.log(`  Last 100: ${chalk.green(String(success))} success, ${chalk.red(String(failed))} failed, ${chalk.gray(String(skipped))} skipped`);
+  console.log(`  Global risk stop:  ${globalRisk.latched ? chalk.red("LATCHED") : chalk.green("clear")}`);
+  console.log(`  Source risk hits:  ${chalk.white(String(sourceRisks.filter((risk) => risk.riskPaused).length))}`);
 
   if (history.length > 0) {
     const last = history[history.length - 1];
     console.log(`  Last execution:    ${chalk.dim(last.timestamp)}`);
   }
+  if (heartbeat.lastErrorAt) {
+    console.log(`  Last error:        ${chalk.dim(fmtAgo(heartbeat.lastErrorAt))} ${heartbeat.note ? chalk.dim(`(${heartbeat.note})`) : ""}`);
+  }
   console.log();
   logCommand("status", [], "ok", { total: addresses.length, executions: history.length });
+}
+
+export async function riskStatusCommand() {
+  const cfg = getConfig();
+  if (!cfg.funderAddress) {
+    console.log(chalk.red("Missing FUNDER_ADDRESS in .env"));
+    logCommand("risk status", [], "error", undefined, "missing funder address");
+    return;
+  }
+  const manager = new RiskManager(DEFAULT_MONITOR_CONFIG, cfg.funderAddress);
+  const snapshot = await manager.snapshot();
+
+  console.log(chalk.bold("\nRisk Status\n"));
+  console.log(`  USDC balance:      ${chalk.white(`$${snapshot.usdcBalance.toFixed(2)}`)}`);
+  console.log(`  Global baseline:   ${chalk.white(`$${snapshot.global.baselineEquityUsdc.toFixed(2)}`)}`);
+  console.log(`  Current equity:    ${chalk.white(`$${snapshot.global.currentEquityUsdc.toFixed(2)}`)}`);
+  console.log(`  Global loss:       ${snapshot.global.lossPct >= cfg.riskGlobalStopPct ? chalk.red(`${(snapshot.global.lossPct * 100).toFixed(2)}%`) : chalk.yellow(`${(snapshot.global.lossPct * 100).toFixed(2)}%`)}`);
+  console.log(`  Global stop:       ${snapshot.global.latched ? chalk.red("LATCHED") : chalk.green("clear")}`);
+
+  if (snapshot.sources.length === 0) {
+    console.log(chalk.dim("\n  No tracked source positions yet.\n"));
+    logCommand("risk status", [], "ok", { sources: 0, globalLossPct: snapshot.global.lossPct });
+    return;
+  }
+
+  console.log(chalk.bold("\n  Source Risk\n"));
+  for (const source of snapshot.sources.slice(0, 20)) {
+    const lossText = `${(source.lossPct * 100).toFixed(2)}%`;
+    const styledLoss = source.lossPct >= cfg.riskSourceStopPct ? chalk.red(lossText) : chalk.yellow(lossText);
+    const state = source.riskPaused ? chalk.red("paused") : chalk.green("active");
+    console.log(
+      `  ${source.sourceAddress.slice(0, 10)}..  basis $${source.baselineCostUsdc.toFixed(2)}  value $${source.currentValueUsdc.toFixed(2)}  pnl $${source.totalPnlUsdc.toFixed(2)}  loss ${styledLoss}  ${state}`
+    );
+  }
+  console.log();
+  logCommand("risk status", [], "ok", {
+    sources: snapshot.sources.length,
+    globalLossPct: snapshot.global.lossPct,
+    latched: snapshot.global.latched,
+  });
+}
+
+export function riskResetGlobalCommand(scope: string) {
+  if (scope !== "global") {
+    console.log(chalk.red("Only 'global' reset is supported."));
+    logCommand("risk reset", [scope], "error", undefined, "unsupported scope");
+    return;
+  }
+  clearGlobalRiskLatch();
+  console.log(chalk.green("Global risk latch cleared."));
+  logCommand("risk reset", [scope], "ok");
+}
+
+export async function alertsTestCommand() {
+  const results = await testAlerts();
+  console.log(chalk.bold("\nAlert Test\n"));
+  for (const result of results) {
+    const status = result.status === "sent"
+      ? chalk.green(result.status)
+      : result.status === "failed"
+        ? chalk.red(result.status)
+        : chalk.yellow(result.status);
+    console.log(`  ${result.channel.padEnd(8)} ${status}${"error" in result && result.error ? ` ${chalk.dim(result.error)}` : ""}`);
+  }
+  console.log();
+  logCommand("alerts test", [], "ok", { results });
 }
 
 export async function importCommand(file: string) {

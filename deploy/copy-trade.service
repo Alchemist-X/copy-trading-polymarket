@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket Copy Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/copy-trading-polymarket
+EnvironmentFile=/home/deploy/copy-trading-polymarket/.env
+ExecStart=/usr/bin/env node dist/index.js start --no-dashboard
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=78
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

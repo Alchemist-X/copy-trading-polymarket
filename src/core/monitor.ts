@@ -1,15 +1,29 @@
+import pLimit from "p-limit";
 import type { ClobClient } from "@polymarket/clob-client";
-import type { FollowedAddress, MonitorConfig, ActivityItem, TradeExecution, FailureCode } from "../types/index.js";
+import type { ActivityItem, FailureCode, FollowedAddress, MonitorConfig, TradeExecution } from "../types/index.js";
 import { DEFAULT_MONITOR_CONFIG } from "../types/index.js";
-import { loadAddresses, saveAddresses, isSeen, markSeen, updateCursor, getCursor, appendExecution, loadState } from "../lib/store.js";
+import {
+  appendExecution,
+  getCursor,
+  getGlobalRiskState,
+  getSourcePosition,
+  isSeen,
+  loadAddresses,
+  loadState,
+  markSeen,
+  saveAddresses,
+  updateCursor,
+  updateServiceHeartbeat,
+} from "../lib/store.js";
 import { fetchActivity, fetchMarketByCondition } from "../lib/polymarket-api.js";
 import { log } from "../lib/logger.js";
+import { sendAlert } from "../lib/alerts.js";
 import { calculateCopy, calculateSellCopy } from "./copy-logic.js";
-import { applyFilters } from "./filters.js";
 import { executeCopyTrade } from "./executor.js";
-import pLimit from "p-limit";
+import { applyFilters } from "./filters.js";
 import { AutoRedeemer } from "./redeemer.js";
 import type { RedeemEvent } from "./redeemer.js";
+import { RiskManager } from "./risk-manager.js";
 
 export interface MonitorStats {
   totalAddresses: number;
@@ -67,10 +81,13 @@ export class TradeMonitor {
   private client: ClobClient;
   private config: MonitorConfig;
   private privateKey: string;
+  private funderAddress: string;
   private abortController: AbortController | null = null;
   private seenSet = new Set<string>();
   private eventListeners: EventCallback[] = [];
   private redeemer: AutoRedeemer | null = null;
+  private riskManager: RiskManager;
+  private lastRiskCheckAt = 0;
   private _stats: MonitorStats = {
     totalAddresses: 0,
     enabledAddresses: 0,
@@ -88,10 +105,12 @@ export class TradeMonitor {
     return this._stats;
   }
 
-  constructor(client: ClobClient, config?: Partial<MonitorConfig>, privateKey?: string) {
+  constructor(client: ClobClient, config?: Partial<MonitorConfig>, privateKey?: string, funderAddress?: string) {
     this.client = client;
     this.config = { ...DEFAULT_MONITOR_CONFIG, ...config };
     this.privateKey = privateKey ?? "";
+    this.funderAddress = funderAddress ?? "";
+    this.riskManager = new RiskManager(this.config, this.funderAddress);
   }
 
   onEvent(cb: EventCallback) {
@@ -110,12 +129,40 @@ export class TradeMonitor {
       return;
     }
 
+    const globalRisk = getGlobalRiskState();
+    if (globalRisk.latched) {
+      updateServiceHeartbeat({
+        status: "risk_latched",
+        globalStopLatched: true,
+        globalStopAt: globalRisk.latchedAt,
+        globalStopReason: globalRisk.reason,
+        note: "refusing to start while global risk latch is active",
+      });
+      throw new Error("GLOBAL_RISK_LATCHED");
+    }
+
     const state = loadState();
     for (const h of state.seenHashes) this.seenSet.add(h);
     log("info", `Loaded ${this.seenSet.size} seen hashes from state`);
 
     this.abortController = new AbortController();
     this._stats.running = true;
+    this.lastRiskCheckAt = 0;
+    updateServiceHeartbeat({
+      pid: process.pid,
+      status: "starting",
+      startedAt: new Date().toISOString(),
+      note: `monitor started (concurrency=${this.config.concurrency}, dryRun=${this.config.dryRun})`,
+      globalStopLatched: false,
+      globalStopAt: undefined,
+      globalStopReason: undefined,
+    });
+    await sendAlert({
+      key: "process:start",
+      severity: "info",
+      title: "Copy trading service started",
+      body: `PID ${process.pid} started at ${new Date().toISOString()}`,
+    });
     log("info", `Monitor started (concurrency=${this.config.concurrency}, dryRun=${this.config.dryRun})`);
 
     if (this.config.autoRedeem && this.privateKey) {
@@ -125,17 +172,56 @@ export class TradeMonitor {
       log("info", `AutoRedeemer enabled (interval=${this.config.redeemIntervalMs}ms)`);
     }
 
-    while (!this.abortController.signal.aborted) {
-      try {
-        await this.runCycle();
-      } catch (err: any) {
-        log("error", `Cycle error: ${err.message}`);
+    try {
+      while (!this.abortController.signal.aborted) {
+        try {
+          await this.runCycle();
+          if (Date.now() - this.lastRiskCheckAt >= this.config.riskCheckIntervalMs) {
+            this.lastRiskCheckAt = Date.now();
+            const risk = await this.riskManager.evaluate();
+            if (risk.global.latched) {
+              log("error", risk.global.reason ?? "global risk latch triggered");
+              this.stop();
+              throw new Error("GLOBAL_RISK_LATCHED");
+            }
+          }
+        } catch (err: any) {
+          updateServiceHeartbeat({
+            status: err.message === "GLOBAL_RISK_LATCHED" ? "risk_latched" : "error",
+            lastErrorAt: new Date().toISOString(),
+            note: err.message ?? String(err),
+            globalStopLatched: err.message === "GLOBAL_RISK_LATCHED",
+            globalStopReason: err.message === "GLOBAL_RISK_LATCHED" ? "global risk latch triggered" : undefined,
+          });
+          if (err.message === "GLOBAL_RISK_LATCHED") throw err;
+          log("error", `Cycle error: ${err.message}`);
+          await sendAlert({
+            key: "engine:cycle-error",
+            severity: "warn",
+            title: "Monitor cycle error",
+            body: err.message ?? String(err),
+          });
+        }
+        await this.sleep(1000);
       }
-      await this.sleep(1000);
+    } finally {
+      this._stats.running = false;
+      const globalRisk = getGlobalRiskState();
+      updateServiceHeartbeat({
+        status: globalRisk.latched ? "risk_latched" : this.abortController?.signal.aborted ? "stopped" : "error",
+        note: "monitor stopped",
+        globalStopLatched: globalRisk.latched,
+        globalStopAt: globalRisk.latchedAt,
+        globalStopReason: globalRisk.reason,
+      });
+      await sendAlert({
+        key: "process:stop",
+        severity: "warn",
+        title: "Copy trading service stopped",
+        body: `Service stopped at ${new Date().toISOString()}`,
+      });
+      log("info", "Monitor stopped");
     }
-
-    this._stats.running = false;
-    log("info", "Monitor stopped");
   }
 
   stop() {
@@ -145,7 +231,10 @@ export class TradeMonitor {
 
   pauseAll() {
     const addresses = loadAddresses();
-    for (const a of addresses) a.enabled = false;
+    for (const a of addresses) {
+      a.enabled = false;
+      a.pauseReason = a.pauseReason ?? "manual";
+    }
     saveAddresses(addresses);
     this._stats.enabledAddresses = 0;
     this._stats.pausedAddresses = addresses.length;
@@ -153,7 +242,12 @@ export class TradeMonitor {
 
   resumeAll() {
     const addresses = loadAddresses();
-    for (const a of addresses) a.enabled = true;
+    for (const a of addresses) {
+      a.enabled = true;
+      a.pauseReason = undefined;
+      a.riskPausedAt = undefined;
+      a.riskNote = undefined;
+    }
     saveAddresses(addresses);
     this._stats.enabledAddresses = addresses.length;
     this._stats.pausedAddresses = 0;
@@ -169,6 +263,11 @@ export class TradeMonitor {
 
     const enabled = addresses.filter((a) => a.enabled);
     if (enabled.length === 0) {
+      updateServiceHeartbeat({
+        status: "running",
+        lastCycleAt: new Date().toISOString(),
+        note: "no enabled addresses",
+      });
       await this.sleep(5000);
       return;
     }
@@ -181,17 +280,25 @@ export class TradeMonitor {
       return now - cursor.lastActivityAt >= interval;
     });
 
-    if (due.length === 0) return;
+    if (due.length === 0) {
+      updateServiceHeartbeat({
+        status: "running",
+        lastCycleAt: new Date().toISOString(),
+      });
+      return;
+    }
 
     const limit = pLimit(this.config.concurrency);
-    const tasks = due.map((addr) =>
-      limit(() => this.pollAddress(addr)),
-    );
-
+    const tasks = due.map((addr) => limit(() => this.pollAddress(addr)));
     await Promise.allSettled(tasks);
 
     this._stats.cycleCount++;
     this._stats.lastCycleMs = Date.now() - t0;
+    updateServiceHeartbeat({
+      status: "running",
+      lastCycleAt: new Date().toISOString(),
+      note: `cycle ${this._stats.cycleCount} (${this._stats.lastCycleMs}ms)`,
+    });
   }
 
   private async pollAddress(addr: FollowedAddress): Promise<void> {
@@ -204,6 +311,9 @@ export class TradeMonitor {
     let activities: ActivityItem[];
     try {
       activities = await fetchActivity(addr.address, startTs);
+      updateServiceHeartbeat({
+        lastSuccessfulPollAt: new Date().toISOString(),
+      });
     } catch (err: any) {
       const msg = err.message ?? String(err);
       let code: FailureCode;
@@ -218,6 +328,10 @@ export class TradeMonitor {
         code = "POLL_API_ERROR";
         log("error", `API error polling ${addrLabel}: ${msg}`, { source: addr.address, code, rawError: msg });
       }
+      updateServiceHeartbeat({
+        lastErrorAt: new Date().toISOString(),
+        note: `${code}:${msg}`,
+      });
       return;
     }
 
@@ -232,7 +346,6 @@ export class TradeMonitor {
       if (this.abortController?.signal.aborted) break;
 
       if (activity.timestamp > maxTs) maxTs = activity.timestamp;
-
       if (!activity.transactionHash) continue;
       if (this.seenSet.has(activity.transactionHash)) continue;
       if (isSeen(activity.transactionHash)) {
@@ -242,7 +355,6 @@ export class TradeMonitor {
 
       this.seenSet.add(activity.transactionHash);
       markSeen(activity.transactionHash);
-
       this._stats.tradesDetected++;
 
       const side = (activity.side ?? "").toUpperCase();
@@ -257,15 +369,17 @@ export class TradeMonitor {
       if (!filterResult.pass) {
         this._stats.tradesSkipped++;
         const skipExec = makeSkipExecution(
-          addr.address, addr.username, activity,
+          addr.address,
+          addr.username,
+          activity,
           filterResult.code ?? "FILTER_MIN_TRIGGER",
           filterResult.reason ?? "filtered",
         );
         appendExecution(skipExec);
         this.emit({ type: "skip", exec: skipExec });
-        log("skip",
-          `[${addrLabel}] ${filterResult.reason} ` +
-          `(${activity.question ?? activity.asset.slice(0, 12)}...)`,
+        log(
+          "skip",
+          `[${addrLabel}] ${filterResult.reason} (${activity.question ?? activity.asset.slice(0, 12)}...)`,
           { source: addr.address, code: filterResult.code },
         );
         continue;
@@ -273,7 +387,10 @@ export class TradeMonitor {
 
       let copyOutcome;
       if (isSell) {
-        copyOutcome = calculateSellCopy(addr, activity, 0);
+        const myPosition = getSourcePosition(addr.address, activity.asset);
+        const currentValue = myPosition?.lastValueUsdc
+          ?? ((myPosition?.netShares ?? 0) * parseFloat(activity.price ?? String(myPosition?.lastPrice ?? 0)));
+        copyOutcome = calculateSellCopy(addr, activity, myPosition?.netShares ?? 0, currentValue);
       } else {
         copyOutcome = calculateCopy(addr, activity);
       }
@@ -281,14 +398,17 @@ export class TradeMonitor {
       if (!copyOutcome.ok) {
         this._stats.tradesSkipped++;
         const skipExec = makeSkipExecution(
-          addr.address, addr.username, activity,
+          addr.address,
+          addr.username,
+          activity,
           copyOutcome.failure.code,
           copyOutcome.failure.reason,
         );
         appendExecution(skipExec);
         this.emit({ type: "skip", exec: skipExec });
         log("skip", `[${addrLabel}] ${copyOutcome.failure.reason}`, {
-          source: addr.address, code: copyOutcome.failure.code,
+          source: addr.address,
+          code: copyOutcome.failure.code,
         });
         continue;
       }

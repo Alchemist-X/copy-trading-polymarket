@@ -1,5 +1,5 @@
 import type { FollowedAddress, ActivityItem, MarketInfo, FailureCode } from "../types/index.js";
-import { loadHistory } from "../lib/store.js";
+import { getLogicallyExecutedSpendForMarket } from "../lib/store.js";
 
 export interface FilterResult {
   pass: boolean;
@@ -40,15 +40,7 @@ export function applyFilters(
   }
 
   if (filters.maxPerMarket && activity.conditionId) {
-    const history = loadHistory();
-    const spent = history
-      .filter(
-        (e) =>
-          e.sourceAddress.toLowerCase() === config.address.toLowerCase() &&
-          e.sourceTrade.conditionId === activity.conditionId &&
-          e.status === "success",
-      )
-      .reduce((sum, e) => sum + (e.executedTrade?.amount ?? 0), 0);
+    const spent = getLogicallyExecutedSpendForMarket(config.address, activity.conditionId);
 
     if (spent >= filters.maxPerMarket) {
       return {

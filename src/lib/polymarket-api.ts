@@ -1,21 +1,18 @@
-import type { ActivityItem, MarketInfo } from "../types/index.js";
 import { ethers } from "ethers";
+import { getConfig } from "./config.js";
+import { HttpError, apiPolicy, pollPolicy, pricePolicy, requestJson } from "./http.js";
+import type { ActivityItem, MarketInfo } from "../types/index.js";
 
-const DATA_API = "https://data-api.polymarket.com";
-const GAMMA_API = "https://gamma-api.polymarket.com";
-const POLYGON_RPC = "https://polygon-bor-rpc.publicnode.com";
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
 
-export async function fetchUsdcBalance(walletAddress: string): Promise<string> {
-  try {
-    const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC);
-    const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
-    const balance = await usdc.balanceOf(walletAddress);
-    return ethers.utils.formatUnits(balance, 6);
-  } catch {
-    return "—";
+let provider: ethers.providers.JsonRpcProvider | null = null;
+
+function getProvider() {
+  if (!provider) {
+    provider = new ethers.providers.JsonRpcProvider(getConfig().polygonRpcUrl);
   }
+  return provider;
 }
 
 function toMs(ts: unknown): number {
@@ -25,30 +22,8 @@ function toMs(ts: unknown): number {
   return n < 1e12 ? n * 1000 : n;
 }
 
-export async function fetchActivity(
-  userAddress: string,
-  startTimestamp?: number,
-  limit = 100,
-): Promise<ActivityItem[]> {
-  const params = new URLSearchParams({
-    user: userAddress,
-    limit: String(limit),
-    type: "TRADE",
-    sortBy: "TIMESTAMP",
-  });
-  if (startTimestamp) {
-    const startSec = startTimestamp > 1e12 ? Math.floor(startTimestamp / 1000) : startTimestamp;
-    params.set("start", String(startSec));
-  }
-
-  const res = await fetch(`${DATA_API}/activity?${params}`);
-  if (!res.ok) {
-    if (res.status === 429) throw new Error("RATE_LIMITED");
-    throw new Error(`Activity API ${res.status}: ${res.statusText}`);
-  }
-
-  const data: any[] = await res.json();
-  return data.map((item) => ({
+function mapActivity(item: any): ActivityItem {
+  return {
     type: item.type ?? "TRADE",
     side: item.side,
     asset: item.asset ?? item.asset_id ?? "",
@@ -61,16 +36,67 @@ export async function fetchActivity(
     title: item.title ?? item.question,
     slug: item.slug,
     question: item.question ?? item.title,
-  }));
+  };
+}
+
+export async function fetchUsdcBalance(walletAddress: string): Promise<string> {
+  try {
+    const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, getProvider());
+    const balance = await usdc.balanceOf(walletAddress);
+    return ethers.utils.formatUnits(balance, 6);
+  } catch {
+    return "—";
+  }
+}
+
+export async function fetchActivity(
+  userAddress: string,
+  startTimestamp?: number,
+  limit = 100,
+): Promise<ActivityItem[]> {
+  const cfg = getConfig();
+  const params = new URLSearchParams({
+    user: userAddress,
+    limit: String(limit),
+    type: "TRADE",
+    sortBy: "TIMESTAMP",
+  });
+  if (startTimestamp) {
+    const startSec = startTimestamp > 1e12 ? Math.floor(startTimestamp / 1000) : startTimestamp;
+    params.set("start", String(startSec));
+  }
+
+  try {
+    const data = await requestJson<any[]>(
+      `${cfg.dataApiUrl}/activity?${params}`,
+      pollPolicy("data-api:activity"),
+    );
+    return data.map(mapActivity);
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 429) throw new Error("RATE_LIMITED");
+    throw err;
+  }
+}
+
+function parseTokenIds(ids: string[] | string | undefined): string[] {
+  if (!ids) return [];
+  if (Array.isArray(ids)) return ids;
+  try {
+    const parsed = JSON.parse(ids);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchMarketByCondition(conditionId: string): Promise<MarketInfo | null> {
+  const cfg = getConfig();
   try {
-    const res = await fetch(`${GAMMA_API}/markets?condition_id=${conditionId}`);
-    if (!res.ok) return null;
-    const data: any[] = await res.json();
+    const data = await requestJson<any[]>(
+      `${cfg.gammaApiUrl}/markets?condition_id=${conditionId}`,
+      apiPolicy("gamma:markets"),
+    );
     if (!data.length) return null;
-
     const m = data[0];
     const tokenIds = parseTokenIds(m.clobTokenIds);
     return {
@@ -87,12 +113,13 @@ export async function fetchMarketByCondition(conditionId: string): Promise<Marke
 }
 
 export async function fetchMarketByToken(tokenId: string): Promise<MarketInfo | null> {
+  const cfg = getConfig();
   try {
-    const res = await fetch(`${GAMMA_API}/markets?clob_token_ids=${tokenId}`);
-    if (!res.ok) return null;
-    const data: any[] = await res.json();
+    const data = await requestJson<any[]>(
+      `${cfg.gammaApiUrl}/markets?clob_token_ids=${tokenId}`,
+      apiPolicy("gamma:markets"),
+    );
     if (!data.length) return null;
-
     const m = data[0];
     const tokenIds = parseTokenIds(m.clobTokenIds);
     return {
@@ -109,10 +136,12 @@ export async function fetchMarketByToken(tokenId: string): Promise<MarketInfo | 
 }
 
 export async function fetchTokenPrice(tokenId: string): Promise<number | null> {
+  const cfg = getConfig();
   try {
-    const res = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`);
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await requestJson<{ price?: string }>(
+      `${cfg.clobHost}/price?token_id=${tokenId}&side=buy`,
+      pricePolicy("clob:price"),
+    );
     return parseFloat(data.price ?? "0") || null;
   } catch {
     return null;
@@ -120,9 +149,53 @@ export async function fetchTokenPrice(tokenId: string): Promise<number | null> {
 }
 
 export async function fetchOrderBook(tokenId: string) {
-  const res = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`);
-  if (!res.ok) return null;
-  return res.json();
+  const cfg = getConfig();
+  try {
+    return await requestJson<any>(
+      `${cfg.clobHost}/book?token_id=${tokenId}`,
+      pricePolicy("clob:book"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export async function estimateSellValueFromOrderBook(tokenId: string, shares: number): Promise<{ valueUsdc: number; pricedShares: number; bestBid?: number } | null> {
+  const book = await fetchOrderBook(tokenId);
+  if (!book || shares <= 0) return null;
+
+  const bids: Array<{ price: number; size: number }> = [];
+  const rawBids = Array.isArray(book.bids) ? book.bids : [];
+  for (const bid of rawBids) {
+    if (Array.isArray(bid) && bid.length >= 2) {
+      bids.push({ price: Number(bid[0]), size: Number(bid[1]) });
+      continue;
+    }
+    bids.push({
+      price: Number(bid.price ?? bid[0] ?? 0),
+      size: Number(bid.size ?? bid.amount ?? bid[1] ?? 0),
+    });
+  }
+
+  bids.sort((a, b) => b.price - a.price);
+  let remaining = shares;
+  let valueUsdc = 0;
+  let pricedShares = 0;
+
+  for (const bid of bids) {
+    if (remaining <= 0) break;
+    if (!(bid.price > 0) || !(bid.size > 0)) continue;
+    const matched = Math.min(remaining, bid.size);
+    valueUsdc += matched * bid.price;
+    pricedShares += matched;
+    remaining -= matched;
+  }
+
+  return {
+    valueUsdc,
+    pricedShares,
+    bestBid: bids[0]?.price,
+  };
 }
 
 export interface AddressProfile {
@@ -161,7 +234,6 @@ export async function verifyAddress(address: string): Promise<AddressProfile> {
     const sorted = [...activities].sort((a, b) => a.timestamp - b.timestamp);
     profile.firstTradeAt = new Date(sorted[0].timestamp).toISOString().slice(0, 10);
     profile.lastTradeAt = new Date(sorted[sorted.length - 1].timestamp).toISOString().slice(0, 10);
-
     profile.recentTrades = activities.slice(0, 10).map((t) => ({
       side: t.side ?? "?",
       amount: t.usdcSize ?? t.size ?? "?",
@@ -172,11 +244,11 @@ export async function verifyAddress(address: string): Promise<AddressProfile> {
 
   profile.positionCount = positions.length;
   profile.positions = positions.slice(0, 10);
-
   return profile;
 }
 
 async function fetchRecentTrades(address: string): Promise<ActivityItem[]> {
+  const cfg = getConfig();
   try {
     const params = new URLSearchParams({
       user: address,
@@ -184,33 +256,23 @@ async function fetchRecentTrades(address: string): Promise<ActivityItem[]> {
       type: "TRADE",
       sortBy: "TIMESTAMP",
     });
-    const res = await fetch(`${DATA_API}/activity?${params}`);
-    if (!res.ok) return [];
-    const data: any[] = await res.json();
-    return data.map((item) => ({
-      type: item.type ?? "TRADE",
-      side: item.side,
-      asset: item.asset ?? item.asset_id ?? "",
-      conditionId: item.conditionId ?? item.condition_id ?? item.market ?? "",
-      size: item.size ?? item.tokens,
-      price: item.price,
-      usdcSize: item.usdcSize ?? item.cash,
-      transactionHash: item.transactionHash ?? item.transaction_hash ?? "",
-      timestamp: toMs(item.timestamp),
-      title: item.title ?? item.question,
-      slug: item.slug,
-      question: item.question ?? item.title,
-    }));
+    const data = await requestJson<any[]>(
+      `${cfg.dataApiUrl}/activity?${params}`,
+      apiPolicy("data-api:recent-trades"),
+    );
+    return data.map(mapActivity);
   } catch {
     return [];
   }
 }
 
 async function fetchPositions(address: string): Promise<Array<{ title: string; size: number; outcome: string }>> {
+  const cfg = getConfig();
   try {
-    const res = await fetch(`${DATA_API}/positions?user=${address}&sizeThreshold=0.1`);
-    if (!res.ok) return [];
-    const data: any[] = await res.json();
+    const data = await requestJson<any[]>(
+      `${cfg.dataApiUrl}/positions?user=${address}&sizeThreshold=0.1`,
+      apiPolicy("data-api:positions"),
+    );
     return data
       .map((p) => ({
         title: p.title ?? p.question ?? p.market ?? "?",
@@ -243,15 +305,17 @@ export async function resolveInput(input: string): Promise<{ address: string; us
 }
 
 export async function searchProfiles(query: string): Promise<ResolvedUser[]> {
+  const cfg = getConfig();
   try {
     const params = new URLSearchParams({
       q: query,
       search_profiles: "true",
       limit_per_type: "5",
     });
-    const res = await fetch(`${GAMMA_API}/public-search?${params}`);
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = await requestJson<any>(
+      `${cfg.gammaApiUrl}/public-search?${params}`,
+      apiPolicy("gamma:public-search"),
+    );
     const profiles: any[] = data.profiles ?? [];
     return profiles
       .filter((p: any) => p.proxyWallet)
@@ -266,10 +330,12 @@ export async function searchProfiles(query: string): Promise<ResolvedUser[]> {
 }
 
 export async function fetchProfile(address: string): Promise<{ name?: string; pseudonym?: string } | null> {
+  const cfg = getConfig();
   try {
-    const res = await fetch(`${GAMMA_API}/public-profile?address=${address}`);
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await requestJson<any>(
+      `${cfg.gammaApiUrl}/public-profile?address=${address}`,
+      apiPolicy("gamma:public-profile"),
+    );
     return { name: data.name, pseudonym: data.pseudonym };
   } catch {
     return null;
@@ -277,22 +343,15 @@ export async function fetchProfile(address: string): Promise<{ name?: string; ps
 }
 
 export async function pingLatency(): Promise<number> {
+  const cfg = getConfig();
   const t0 = Date.now();
   try {
-    await fetch("https://clob.polymarket.com/time");
+    await requestJson(
+      `${cfg.clobHost}/time`,
+      pricePolicy("clob:time"),
+    );
+    return Date.now() - t0;
   } catch {
     return -1;
-  }
-  return Date.now() - t0;
-}
-
-function parseTokenIds(ids: string[] | string | undefined): string[] {
-  if (!ids) return [];
-  if (Array.isArray(ids)) return ids;
-  try {
-    const parsed = JSON.parse(ids);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
   }
 }
